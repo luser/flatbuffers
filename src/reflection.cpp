@@ -18,9 +18,176 @@
 
 #include "flatbuffers/util.h"
 
+#include <algorithm>
+
+#ifndef FLATBUFFERS_CPP98_STL
+#  include <stack>
+#  include <unordered_map>
+typedef std::unordered_map<std::string, flatbuffers::uoffset_t> TypeNameMap;
+#endif
+
+bool log_enabled = false;
+#define LOG(...) if (log_enabled) { printf(__VA_ARGS__); }
+
 // Helper functionality for reflection.
 
 namespace flatbuffers {
+
+struct Entry {
+    std::string name;
+    unsigned int count;
+    size_t self_bytes;
+    size_t total_bytes;
+};
+
+bool entry_compare(const Entry& a, const Entry& b) {
+    return a.total_bytes < b.total_bytes;
+}
+
+class AccountingMap {
+public:
+    AccountingMap(const reflection::Schema& schema, const uint8_t* buf, size_t length):
+        buf_(buf),
+        buf_length_(length),
+        max_name_len_(8),
+        counted_(),
+        ledger_(),
+        stack_(),
+        total_bytes_(0)
+    {
+        if (getenv("LOG") != nullptr) {
+            log_enabled = true;
+        }
+        size_t max_name = 8;
+        for (uoffset_t i=0; i < schema.objects()->Length(); i++) {
+            auto obj = schema.objects()->Get(i);
+            auto name = obj->name()->str();
+            max_name = std::max(max_name, name.length());
+        }
+        for (uoffset_t i=0; i < schema.enums()->Length(); i++) {
+            auto en = schema.enums()->Get(i);
+            auto name = en->name()->str();
+            max_name = std::max(max_name, name.length());
+        }
+        max_name_len_ = static_cast<int>(max_name);
+    }
+    
+    void count(const reflection::Object& obj, const flatbuffers::Table* table) {
+        Entry e = { obj.name()->str(), 0, 0, 0 };
+        if (have_counted(OffsetOf(reinterpret_cast<const uint8_t*>(table)))) {
+            LOG("Skipping already-counted object (%s)\n", e.name.c_str());
+            e.name = "";
+        } else {
+            count_to_entry(table, e);
+        }
+        stack_.push(e);
+    }
+    
+    void finish_object() {
+        if (!stack_.empty()) {
+            auto entry = stack_.top();
+            size_t total_bytes = entry.total_bytes;
+            // Empty names are a placeholder for "already counted".
+            if (!entry.name.empty()) {
+                LOG("[%lu] Finish counting %s [%lu bytes]\n", stack_.size(), entry.name.c_str(), entry.total_bytes);
+                auto rec = ledger_.find(entry.name);
+                
+                if (rec == ledger_.end()) {
+                    ledger_.emplace(entry.name, entry);
+                } else {
+                    auto& e = rec->second;
+                    e.count += 1;
+                    e.self_bytes += entry.self_bytes;
+                    e.total_bytes += entry.total_bytes;
+                }
+            } else {
+                total_bytes = 0;
+            }
+            stack_.pop();
+            total_bytes_ += total_bytes;
+            LOG(" total_bytes: %lu\n", total_bytes_);
+        }
+    }
+    
+    void count_vector_or_string_field(const flatbuffers::Table* table, const reflection::Field& field, const reflection::Schema &schema) {
+        auto p = table->GetPointer<const uoffset_t *>(field.offset());
+        if (!p) {
+            return;
+        }
+        auto offset = OffsetOf(reinterpret_cast<const uint8_t*>(p));
+        if (!stack_.empty() && offset && !have_counted(offset)) {
+            auto& entry = stack_.top();
+            if (field.type()->base_type() == reflection::String) {
+                // Strings start with their length in bytes
+                entry.total_bytes += *p;
+                LOG("[%lu] %s: Counting string of %u bytes\n", stack_.size(), field.name()->str().c_str(), *p);
+            } else if (field.type()->base_type() == reflection::Vector) {
+                auto element_size = GetTypeSizeInline(field.type()->element(), field.type()->index(), schema);
+                entry.total_bytes += *p * element_size;
+                LOG("[%lu] %s: Counting vector of %u entries %lu per entry: %lu bytes\n", stack_.size(), field.name()->str().c_str(), *p, element_size, *p * element_size);
+            }
+        }
+    }
+    
+    void print_summary() {
+        printf("%-*s\tcount\tself bytes\ttotal bytes\tavg\n", max_name_len_, "name");
+        
+        std::vector<Entry> entries;
+        std::transform(ledger_.begin(),
+                       ledger_.end(),
+                       std::back_inserter(entries),
+                       [](std::unordered_map<std::string, Entry>::value_type &kv){ return kv.second;}
+        );
+        std::sort(entries.begin(), entries.end(), entry_compare);
+        for (auto& entry : entries) {
+            printf("%-*s\t%5u\t%10zu\t%10zu\t%6lu\n", max_name_len_, entry.name.c_str(), entry.count, entry.self_bytes, entry.total_bytes, entry.total_bytes / entry.count);
+        }
+        float pct = 100.0 * static_cast<float>(total_bytes_) / static_cast<float>(buf_length_);
+        printf("\nAccounted for %zu/%zu bytes (%.02f%%)\n", total_bytes_, buf_length_, pct);
+    }
+
+private:
+    void count_to_entry(const flatbuffers::Table* table, Entry& entry) {
+        auto vtable = table->GetVTable();
+        auto vtable_size = ReadScalar<voffset_t>(vtable);
+        auto obj_size = ReadScalar<voffset_t>(vtable + sizeof(voffset_t));
+        entry.count++;
+        entry.self_bytes += obj_size;
+        entry.total_bytes += obj_size;
+        voffset_t vofs = OffsetOf(vtable);
+        if (!have_counted(vofs)) {
+            entry.total_bytes += vtable_size;
+        }
+        LOG("[%lu] Start counting %s self: %zu, total: %zu\n", stack_.size() + 1, entry.name.c_str(), entry.self_bytes, entry.total_bytes);
+    }
+    
+    bool have_counted(uoffset_t offset) {
+        bool counted = counted_.find(offset) != counted_.end();
+        if (!counted) {
+            mark_counted(offset);
+        }
+        return counted;
+    }
+    
+    void mark_counted(uoffset_t offset) {
+        counted_.insert(offset);
+    }
+    
+    uoffset_t OffsetOf(const uint8_t* p) {
+        return static_cast<uoffset_t>(p - buf_);
+    }
+    
+    const uint8_t* buf_;
+    size_t buf_length_;
+    int max_name_len_;
+    // Already-counted objects, by offset.
+    std::set<uoffset_t> counted_;
+    // Already-accumulated stats, by type name.
+    std::unordered_map<std::string, Entry> ledger_;
+    // The stack of objects being traversed.
+    std::stack<Entry> stack_;
+    size_t total_bytes_;
+};
 
 int64_t GetAnyValueI(reflection::BaseType type, const uint8_t *data) {
 // clang-format off
@@ -500,6 +667,7 @@ Offset<const Table *> CopyTable(FlatBufferBuilder &fbb,
 bool VerifyStruct(flatbuffers::Verifier &v,
                   const flatbuffers::Table &parent_table,
                   voffset_t field_offset, const reflection::Object &obj,
+                  AccountingMap &accounting,
                   bool required) {
   auto offset = parent_table.GetOptionalFieldOffset(field_offset);
   if (required && !offset) { return false; }
@@ -521,11 +689,14 @@ bool VerifyVectorOfStructs(flatbuffers::Verifier &v,
 // forward declare to resolve cyclic deps between VerifyObject and VerifyVector
 bool VerifyObject(flatbuffers::Verifier &v, const reflection::Schema &schema,
                   const reflection::Object &obj,
-                  const flatbuffers::Table *table, bool required);
+                  const flatbuffers::Table *table,
+                  AccountingMap &accounting,
+                  bool required);
 
 bool VerifyUnion(flatbuffers::Verifier &v, const reflection::Schema &schema,
                  uint8_t utype, const uint8_t *elem,
-                 const reflection::Field &union_field) {
+                 const reflection::Field &union_field,
+                 AccountingMap &accounting) {
   if (!utype) return true;  // Not present.
   auto fb_enum = schema.enums()->Get(union_field.type()->index());
   if (utype >= fb_enum->values()->size()) return false;
@@ -538,6 +709,7 @@ bool VerifyUnion(flatbuffers::Verifier &v, const reflection::Schema &schema,
       } else {
         return VerifyObject(v, schema, *elem_obj,
                             reinterpret_cast<const flatbuffers::Table *>(elem),
+                            accounting,
                             true);
       }
     }
@@ -550,7 +722,8 @@ bool VerifyUnion(flatbuffers::Verifier &v, const reflection::Schema &schema,
 
 bool VerifyVector(flatbuffers::Verifier &v, const reflection::Schema &schema,
                   const flatbuffers::Table &table,
-                  const reflection::Field &vec_field) {
+                  const reflection::Field &vec_field,
+                  AccountingMap &accounting) {
   FLATBUFFERS_ASSERT(vec_field.type()->base_type() == reflection::Vector);
   if (!table.VerifyField<uoffset_t>(v, vec_field.offset())) return false;
 
@@ -596,7 +769,7 @@ bool VerifyVector(flatbuffers::Verifier &v, const reflection::Schema &schema,
         if (!v.VerifyVector(vec)) return false;
         if (!vec) return true;
         for (uoffset_t j = 0; j < vec->size(); j++) {
-          if (!VerifyObject(v, schema, *obj, vec->Get(j), true)) {
+          if (!VerifyObject(v, schema, *obj, vec->Get(j), accounting, true)) {
             return false;
           }
         }
@@ -615,7 +788,7 @@ bool VerifyVector(flatbuffers::Verifier &v, const reflection::Schema &schema,
         //  get union type from the prev field
         auto utype = type_vec->Get(j);
         auto elem = vec->Get(j);
-        if (!VerifyUnion(v, schema, utype, elem, vec_field)) return false;
+        if (!VerifyUnion(v, schema, utype, elem, vec_field, accounting)) return false;
       }
       return true;
     }
@@ -627,9 +800,12 @@ bool VerifyVector(flatbuffers::Verifier &v, const reflection::Schema &schema,
 
 bool VerifyObject(flatbuffers::Verifier &v, const reflection::Schema &schema,
                   const reflection::Object &obj,
-                  const flatbuffers::Table *table, bool required) {
+                  const flatbuffers::Table *table,
+                  AccountingMap &accounting,
+                  bool required) {
   if (!table) return !required;
   if (!table->VerifyTableStart(v)) return false;
+  accounting.count(obj, table);
   for (uoffset_t i = 0; i < obj.fields()->size(); i++) {
     auto field_def = obj.fields()->Get(i);
     switch (field_def->type()->base_type()) {
@@ -665,20 +841,24 @@ bool VerifyObject(flatbuffers::Verifier &v, const reflection::Schema &schema,
             !v.VerifyString(flatbuffers::GetFieldS(*table, *field_def))) {
           return false;
         }
+        accounting.count_vector_or_string_field(table, *field_def, schema);
         break;
       case reflection::Vector:
-        if (!VerifyVector(v, schema, *table, *field_def)) return false;
+        if (!VerifyVector(v, schema, *table, *field_def, accounting)) return false;
+        accounting.count_vector_or_string_field(table, *field_def, schema);
         break;
       case reflection::Obj: {
         auto child_obj = schema.objects()->Get(field_def->type()->index());
         if (child_obj->is_struct()) {
           if (!VerifyStruct(v, *table, field_def->offset(), *child_obj,
+                            accounting,
                             field_def->required())) {
             return false;
           }
         } else {
           if (!VerifyObject(v, schema, *child_obj,
                             flatbuffers::GetFieldT(*table, *field_def),
+                            accounting,
                             field_def->required())) {
             return false;
           }
@@ -691,7 +871,7 @@ bool VerifyObject(flatbuffers::Verifier &v, const reflection::Schema &schema,
         auto utype = table->GetField<uint8_t>(utype_offset, 0);
         auto uval = reinterpret_cast<const uint8_t *>(
             flatbuffers::GetFieldT(*table, *field_def));
-        if (!VerifyUnion(v, schema, utype, uval, *field_def)) { return false; }
+        if (!VerifyUnion(v, schema, utype, uval, *field_def, accounting)) { return false; }
         break;
       }
       default: FLATBUFFERS_ASSERT(false); break;
@@ -699,6 +879,7 @@ bool VerifyObject(flatbuffers::Verifier &v, const reflection::Schema &schema,
   }
 
   if (!v.EndTable()) return false;
+  accounting.finish_object();
 
   return true;
 }
@@ -707,7 +888,10 @@ bool Verify(const reflection::Schema &schema, const reflection::Object &root,
             const uint8_t *buf, size_t length, uoffset_t max_depth /*= 64*/,
             uoffset_t max_tables /*= 1000000*/) {
   Verifier v(buf, length, max_depth, max_tables);
-  return VerifyObject(v, schema, root, flatbuffers::GetAnyRoot(buf), true);
+  AccountingMap accounting(schema, buf, length);
+  bool res = VerifyObject(v, schema, root, flatbuffers::GetAnyRoot(buf), accounting, true);
+  accounting.print_summary();
+  return res;
 }
 
 }  // namespace flatbuffers
