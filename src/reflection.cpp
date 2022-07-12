@@ -71,7 +71,7 @@ public:
         }
         max_name_len_ = static_cast<int>(max_name);
     }
-    
+
     void count(const reflection::Object& obj, const flatbuffers::Table* table) {
         Entry e = { obj.name()->str(), 0, 0, 0 };
         if (have_counted(OffsetOf(reinterpret_cast<const uint8_t*>(table)))) {
@@ -82,7 +82,7 @@ public:
         }
         stack_.push(e);
     }
-    
+
     void finish_object() {
         if (!stack_.empty()) {
             auto entry = stack_.top();
@@ -91,7 +91,7 @@ public:
             if (!entry.name.empty()) {
                 LOG("[%lu] Finish counting %s [%lu bytes]\n", stack_.size(), entry.name.c_str(), entry.total_bytes);
                 auto rec = ledger_.find(entry.name);
-                
+
                 if (rec == ledger_.end()) {
                     ledger_.emplace(entry.name, entry);
                 } else {
@@ -108,7 +108,7 @@ public:
             LOG(" total_bytes: %lu\n", total_bytes_);
         }
     }
-    
+
     void count_vector_or_string_field(const flatbuffers::Table* table, const reflection::Field& field, const reflection::Schema &schema) {
         auto p = table->GetPointer<const uoffset_t *>(field.offset());
         if (!p) {
@@ -128,19 +128,24 @@ public:
             }
         }
     }
-    
+
     void print_summary() {
-        printf("%-*s\tcount\tself bytes\ttotal bytes\tavg\n", max_name_len_, "name");
-        
-        std::vector<Entry> entries;
-        std::transform(ledger_.begin(),
-                       ledger_.end(),
-                       std::back_inserter(entries),
-                       [](std::unordered_map<std::string, Entry>::value_type &kv){ return kv.second;}
-        );
-        std::sort(entries.begin(), entries.end(), entry_compare);
-        for (auto& entry : entries) {
-            printf("%-*s\t%5u\t%10zu\t%10zu\t%6lu\n", max_name_len_, entry.name.c_str(), entry.count, entry.self_bytes, entry.total_bytes, entry.total_bytes / entry.count);
+      printf("%-*s\tcount\tself bytes\ttotal bytes\tavg (total)\t%% of total\n",
+             max_name_len_, "name");
+
+      std::vector<Entry> entries;
+      std::transform(
+          ledger_.begin(), ledger_.end(), std::back_inserter(entries),
+          [](std::unordered_map<std::string, Entry>::value_type &kv) {
+            return kv.second;
+          });
+      std::sort(entries.begin(), entries.end(), entry_compare);
+      for (auto &entry : entries) {
+        float this_pct = 100.0 * static_cast<float>(entry.total_bytes) /
+                         static_cast<float>(buf_length_);
+        printf("%-*s\t%5u\t%10zu\t%11zu\t%11lu\t%10.2f\n", max_name_len_,
+               entry.name.c_str(), entry.count, entry.self_bytes,
+               entry.total_bytes, entry.total_bytes / entry.count, this_pct);
         }
         float pct = 100.0 * static_cast<float>(total_bytes_) / static_cast<float>(buf_length_);
         printf("\nAccounted for %zu/%zu bytes (%.02f%%)\n", total_bytes_, buf_length_, pct);
@@ -160,7 +165,7 @@ private:
         }
         LOG("[%lu] Start counting %s self: %zu, total: %zu\n", stack_.size() + 1, entry.name.c_str(), entry.self_bytes, entry.total_bytes);
     }
-    
+
     bool have_counted(uoffset_t offset) {
         bool counted = counted_.find(offset) != counted_.end();
         if (!counted) {
@@ -168,15 +173,15 @@ private:
         }
         return counted;
     }
-    
+
     void mark_counted(uoffset_t offset) {
         counted_.insert(offset);
     }
-    
+
     uoffset_t OffsetOf(const uint8_t* p) {
         return static_cast<uoffset_t>(p - buf_);
     }
-    
+
     const uint8_t* buf_;
     size_t buf_length_;
     int max_name_len_;
